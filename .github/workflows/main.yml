@@ -5,189 +5,176 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      # ─────────────────────────────────────────────
-      # 1. LIBERAR ESPACIO Y MONTAR DISCO EXTRA
-      # ─────────────────────────────────────────────
-      - name: Free Up Space & Mount Extra Disk
+      - name: Install Node, Python, Git
+        shell: pwsh
         run: |
-          Write-Host "=== Disk before cleanup ===" -ForegroundColor Cyan
-          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
+          choco install nodejs-lts python git 7zip -y --no-progress
+          $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+          node --version
+          npm --version
+          python --version
+          git --version
 
-          $toRemove = @(
-            "$env:SystemDrive\hostedtoolcache\windows\Ruby",
-            "$env:SystemDrive\hostedtoolcache\windows\go",
-            "$env:SystemDrive\hostedtoolcache\windows\Python",
-            "$env:ProgramFiles\dotnet",
-            "$env:ProgramFiles\MongoDB",
-            "$env:ProgramFiles\PostgreSQL",
-            "$env:ProgramFiles (x86)\Google\Chrome",
-            "$env:ProgramFiles\Mozilla Firefox"
-          )
-          foreach ($path in $toRemove) {
-            if (Test-Path $path) {
-              Remove-Item $path -Recurse -Force -ErrorAction SilentlyContinue
-              Write-Host "Removed: $path" -ForegroundColor Green
-            }
+      - name: Install OpenCode
+        shell: pwsh
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+          npm install -g opencode-ai@latest
+          $npmBin = (npm config get prefix).Trim()
+          $machinePath = [Environment]::GetEnvironmentVariable("Path","Machine")
+          if ($machinePath -notlike "*$npmBin*") {
+            [Environment]::SetEnvironmentVariable("Path", "$machinePath;$npmBin", "Machine")
+          }
+          $env:Path += ";$npmBin"
+          opencode --version
+
+      - name: Install Mesa3D (safe mode)
+        shell: pwsh
+        run: |
+          $ver = "24.3.4"
+          $url = "https://github.com/pal1000/mesa-dist-win/releases/download/$ver/mesa3d-$ver-release-msvc.7z"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\mesa3d.7z" -UseBasicParsing
+
+          $mesaDir = "C:\mesa3d"
+          New-Item -ItemType Directory -Force -Path $mesaDir | Out-Null
+          & "C:\Program Files\7-Zip\7z.exe" x "$env:TEMP\mesa3d.7z" -o"$mesaDir" -y | Out-Null
+
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" -OutFile "$env:TEMP\vc.exe" -UseBasicParsing
+          Start-Process "$env:TEMP\vc.exe" -ArgumentList "/quiet","/norestart" -Wait
+
+          $vars = @{
+            "GALLIUM_DRIVER"              = "llvmpipe"
+            "LP_NUM_THREADS"              = "$env:NUMBER_OF_PROCESSORS"
+            "MESA_GL_VERSION_OVERRIDE"    = "4.5COMPAT"
+            "MESA_GLSL_VERSION_OVERRIDE"  = "450"
+            "MESA_GLTHREAD"               = "true"
+          }
+          foreach ($k in $vars.Keys) {
+            [Environment]::SetEnvironmentVariable($k, $vars[$k], "Machine")
           }
 
-          Write-Host "=== Disk D: info ===" -ForegroundColor Cyan
-          Get-PSDrive D -ErrorAction SilentlyContinue
+          $x64 = (Get-ChildItem $mesaDir -Directory -Recurse -Filter "x64" | Select-Object -First 1).FullName
+          $bat = @"
+          @echo off
+          if "%~1"=="" (echo Arrastra la carpeta de la app sobre este archivo & pause & exit /b)
+          copy /Y "$x64\opengl32.dll" "%~1\" >nul
+          copy /Y "$x64\libgallium_wgl.dll" "%~1\" >nul
+          copy /Y "$x64\libglapi.dll" "%~1\" >nul
+          echo Mesa3D activado en: %~1
+          pause
+          "@
+          Set-Content -Path "C:\Users\Public\Desktop\Activar-3D-en-app.bat" -Value $bat -Encoding ASCII
+          Write-Host "Mesa3D listo en $x64 (sin tocar System32)" -ForegroundColor Green
 
-          $vhdPath = "D:\extra_disk.vhdx"
-          New-VHD -Path $vhdPath -SizeBytes 100GB -Dynamic -ErrorAction SilentlyContinue
-          Mount-VHD -Path $vhdPath
-          $disk = Get-Disk | Where-Object { $_.OperationalStatus -eq 'Online' -and $_.PartitionStyle -eq 'RAW' } | Select-Object -Last 1
-          if ($disk) {
-            Initialize-Disk -Number $disk.Number -PartitionStyle MBR -PassThru |
-              New-Partition -AssignDriveLetter -UseMaximumSize |
-              Format-Volume -FileSystem NTFS -NewFileSystemLabel "ExtraDisk" -Confirm:$false
-          }
-
-          Write-Host "=== Disk after setup ===" -ForegroundColor Cyan
-          Get-PSDrive -PSProvider FileSystem | Select-Object Name, Used, Free | Format-Table
-
-          "EXTRA_DISK=E:" | Out-File -FilePath $env:GITHUB_ENV -Append
-          "STORAGE_ROOT=D:\storage" | Out-File -FilePath $env:GITHUB_ENV -Append
-          New-Item -ItemType Directory -Force -Path "D:\storage" | Out-Null
-
-      # ─────────────────────────────────────────────
-      # 3. CONFIGURAR RDP
-      # ─────────────────────────────────────────────
-      - name: Configure RDP Settings
+      - name: Configure RDP
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
-
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
-          Write-Host "RDP configured." -ForegroundColor Green
 
-      # ─────────────────────────────────────────────
-      # 4. CREAR USUARIO RDP
-      # ─────────────────────────────────────────────
       - name: Create RDP User
+        shell: pwsh
         run: |
-          $charSet = @{
-            Upper   = [char[]](65..90)
-            Lower   = [char[]](97..122)
-            Number  = [char[]](48..57)
-            Special = [char[]]@(33,35,36,37,38,42,43,45,61,64)
+          # Generar contraseña aleatoria robusta (20 caracteres)
+          $upper = (65..90) | ForEach-Object { [char]$_ }
+          $lower = (97..122) | ForEach-Object { [char]$_ }
+          $digits = (48..57) | ForEach-Object { [char]$_ }
+          $symbols = @(33,35,36,37,38,42,43,45,61,64,63) | ForEach-Object { [char]$_ }
+          
+          # Asegurar al menos uno de cada tipo
+          $password = @(
+            $upper | Get-Random
+            $upper | Get-Random
+            $lower | Get-Random
+            $lower | Get-Random
+            $digits | Get-Random
+            $digits | Get-Random
+            $symbols | Get-Random
+            $symbols | Get-Random
+          )
+          
+          # Completar hasta 20 caracteres aleatorios
+          $allChars = $upper + $lower + $digits + $symbols
+          while ($password.Count -lt 20) {
+            $password += $allChars | Get-Random
           }
-          $rawPassword  = @()
-          $rawPassword += $charSet.Upper   | Get-Random -Count 4
-          $rawPassword += $charSet.Lower   | Get-Random -Count 4
-          $rawPassword += $charSet.Number  | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
-
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators"        -Member "RDP" -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users"  -Member "RDP" -ErrorAction SilentlyContinue
-
-          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
-            Write-Error "User creation failed"; exit 1
+          
+          # Mezclar
+          $password = -join ($password | Sort-Object { Get-Random })
+          
+          # MOSTRAR CONTRASEÑA COMPLETA (evitando filtros de GitHub)
+          Write-Host "=========================================="
+          Write-Host "CONTRASEÑA RDP GENERADA:"
+          Write-Host $password
+          Write-Host "=========================================="
+          
+          # También guardar en archivo por si acaso
+          $password | Out-File -FilePath "$env:USERPROFILE\Desktop\rdp_password.txt" -Encoding utf8
+          
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $secure -AccountNeverExpires -ErrorAction SilentlyContinue | Out-Null
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+          
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) { 
+            Write-Error "User creation failed"
+            exit 1 
           }
+          
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "RDP user created." -ForegroundColor Green
-
-      # ─────────────────────────────────────────────
-      # 5. INSTALAR TAILSCALE
-      # ─────────────────────────────────────────────
       - name: Install Tailscale
+        shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $installer -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i","`"$installer`"","/quiet","/norestart" -Wait
           Remove-Item $installer -Force
 
-      # ─────────────────────────────────────────────
-      # 6. CONECTAR TAILSCALE
-      # ─────────────────────────────────────────────
       - name: Connect Tailscale
+        shell: pwsh
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
           & $ts up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
 
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 15) {
+          $tsIP = $null; $i = 0
+          while (-not $tsIP -and $i -lt 15) {
             Start-Sleep -Seconds 4
-            $tsIP = & $ts ip -4 2>$null
-            $retries++
-          }
-
-          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
-          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Tailscale IP: $tsIP" -ForegroundColor Green
-
-      # ─────────────────────────────────────────────
-      # 7. VERIFICAR RDP
-      # ─────────────────────────────────────────────
-      - name: Verify RDP
-        run: |
-          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $test.TcpTestSucceeded) {
-            Write-Error "RDP port 3389 not reachable"; exit 1
-          }
-          Write-Host "RDP reachable on port 3389 ✓" -ForegroundColor Green
-
-      # ─────────────────────────────────────────────
-      # 8. VERIFICAR APLICACIONES INSTALADAS
-      # ─────────────────────────────────────────────
-      - name: Verify Installed Apps
-        run: |
-          Write-Host ""
-          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
-          Write-Host "║         VERIFICATION REPORT                      ║" -ForegroundColor Cyan
-          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
-          
-          Write-Host "║  NODE.JS:" -NoNewline
-          try { node --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
-          
-          Write-Host "║  NPM:    " -NoNewline
-          try { npm --version 2>$null; Write-Host " ✓" -ForegroundColor Green } catch { Write-Host " ✗" -ForegroundColor Red }
-          
-          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
-          Write-Host ""
-
-      # ─────────────────────────────────────────────
-      # 9. MANTENER SESIÓN ACTIVA
-      # ─────────────────────────────────────────────
-      - name: Keep Alive & Show Credentials
-        run: |
-          Write-Host ""
-          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
-          Write-Host "║         RDP ACCESS INFO                          ║" -ForegroundColor Cyan
-          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
-          Write-Host "║  IP:       $env:TAILSCALE_IP"
-          Write-Host "║  User:     RDP"
-          Write-Host "║  Password: $env:RDP_PASSWORD"
-          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
-          Write-Host "║  STORAGE                                         ║" -ForegroundColor Cyan
-          Write-Host "║  C: ~14GB (sistema)                              ║"
-          Write-Host "║  D: ~70GB (runner disk)                          ║"
-          Write-Host "║  E: ~100GB (VHD extra)                           ║"
-          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
-          Write-Host ""
-
-          # Mantener la sesión activa
-          $i = 0
-          while ($true) {
-            Start-Sleep -Seconds 60
+            $tsIP = (& $ts ip -4 2>$null | Select-Object -First 1)
             $i++
-            Write-Host "Keep alive... ($i minutos)" -ForegroundColor DarkGray
           }
-          
+          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          "TAILSCALE_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify
+        shell: pwsh
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $test.TcpTestSucceeded) { Write-Error "RDP 3389 no accesible"; exit 1 }
+
+          Write-Host "RDP    : OK"
+          Write-Host "Node   : $(node --version)"
+          Write-Host "NPM    : $(npm --version)"
+          Write-Host "Python : $(python --version)"
+          Write-Host "Git    : $(git --version)"
+          Write-Host "OpenCode: $(opencode --version)"
+          Write-Host "Mesa3D : $(Test-Path 'C:\mesa3d')"
+
+      - name: Keep Alive
+        shell: pwsh
+        run: |
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "IP:       $env:TAILSCALE_IP"
+          Write-Host "User:     RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "3D: Mesa llvmpipe (ejecuta 'Activar-3D-en-app.bat' del escritorio para cada app)"
+          Write-Host "================================"
+          while ($true) { Start-Sleep -Seconds 60 }
